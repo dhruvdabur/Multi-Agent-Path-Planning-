@@ -276,6 +276,7 @@ class BotState:
         self.last_path_calc_time = 0.0
         self.passed_gate = False
         self.passed_pickup_staging = False
+        self.swap_m1_m2 = True
 
 
 
@@ -404,6 +405,7 @@ class HolonomicMoveToCratesMulti(Node):
         self.node_start_time = time.time()
         self.startup_delay = 5.0  # Seconds to wait for vision
         self.is_warmed_up = False
+        self.swap_m1_m2 = True
 
         self.warmup_crate_buffer = {} # Dictionary to store lists of coordinates
         self.assigned_zones_this_cycle = set()
@@ -657,7 +659,7 @@ class HolonomicMoveToCratesMulti(Node):
 
         # Store the mode in the class for easy access
         self.simulation_mode = SIMULATION_MODE 
-
+        
         # ---------------- HARDWARE / SIM SETUP ----------------
         if self.simulation_mode:
             # If in Simulation, we initialize the Link Attacher clients
@@ -3160,157 +3162,85 @@ class HolonomicMoveToCratesMulti(Node):
     * Example Call: self.move_to_final_goal(bot)
     """
     
-    def move_to_final_goal(self, bot: BotState):
-        # 1. Identify Target Zone & Drop Position
-        crate_id = bot.tracked_crate_id
-        if crate_id is None: return
+    def move_to_point(self, bot: BotState, goal, label="target", xy_tol=None, theta_tol=None):
+        if bot.pose is None:
+            return False
 
-        zone_id = self.get_zone_for_crate(crate_id)
-        drop = self.drop_positions.get(crate_id)
+        bot.is_moving = True
+        now = self.get_clock().now()
 
-        # 2. FAIL-SAFE: If missing, retry assignment
-        if drop is None:
-            self.get_logger().warn(f"Bot {bot.id} | Drop position missing. Retrying assignment...")
-            self.assign_drop_positions()
-            drop = self.drop_positions.get(crate_id)
-
-        if drop is None: return
-        # --- NEW DYNAMIC EDGE ASSIGNMENT ---
-        # 1. If this bot hasn't claimed an approach edge for this drop yet
-        if getattr(bot, 'drop_edge', None) is None:
-            # 2. Create an empty set to keep track of edges taken by other bots
-            occupied_edges = set()
-            # 3. Loop through every other bot in the fleet
-            for ob in self.bots.values():
-                # 4. Skip ourselves and ignore bots that haven't claimed an edge
-                if ob.id != bot.id and getattr(ob, 'drop_edge', None) is not None:
-                    # 5. Check if the other bot is carrying a crate to our exact same zone
-                    if ob.tracked_crate_id is not None and self.get_zone_for_crate(ob.tracked_crate_id) == zone_id:
-                        # 6. If they are, mark their specific edge (0, 1, 2, or 3) as taken
-                        occupied_edges.add(ob.drop_edge)
-            
-            # 7. Loop through the possible edges in priority order (Bottom, Top, Right, Left)
-            for edge in [0, 1, 2, 3]:
-                # 8. If we find an edge that nobody else has claimed
-                if edge not in occupied_edges:
-                    # 9. Claim it for ourselves
-                    bot.drop_edge = edge
-                    # 10. Stop looking and proceed with the newly claimed edge
-                    break
-
-        # --- CALCULATE GEOMETRIC OFFSETS ---
-        # 11. Initialize empty variables for the X and Y offsets
-        stage_dx, stage_dy = 0.0, 0.0
-        drop_dx, drop_dy = 0.0, 0.0
-        # 12. Initialize the default heading angle to zero degrees
-        drop_theta = 0.0
-        
-        # 13. Apply offsets based on the edge we just claimed
-        if getattr(bot, 'drop_edge', 0) == 0:   # Edge 0: Standard Bottom Approach # Edge 0: Standard Bottom Approach
-            # 14. Approach from -Y, facing straight up (0 degrees)
-            stage_dy, drop_dy, drop_theta = -250.0, -150.0, 0.0
-        elif bot.drop_edge == 1: # Edge 1: Top Approach
-            # 15. Approach from +Y, facing upside down (180 degrees)
-            stage_dy, drop_dy, drop_theta = 250.0, 150.0, 180.0
-        elif bot.drop_edge == 2: # Edge 2: Right Approach
-            # 16. Approach from +X, facing left (90 degrees)
-            stage_dx, drop_dx, drop_theta = 250.0, 150.0, 90.0
-        elif bot.drop_edge == 3: # Edge 3: Left Approach
-            # 17. Approach from -X, facing right (-90 degrees)
-            stage_dx, drop_dx, drop_theta = -250.0, -150.0, -90.0
-
-        
-        # 3. Slot Priority Logic (5-Crate Setup)
-        # ... keep your existing wait logic here ...
-        
-        # 19. Build the final approach goal using the dynamic X/Y offsets and Theta
-        final_goal = np.array([drop['x'] + drop_dx, drop['y'] + drop_dy, drop_theta])
-        bot.goal = final_goal.copy()
-
-        if not bot.passed_drop_staging:
-            # Same Y as final approach (y - 150), but backed off X by 100
-            staging_goal = np.array([drop['x'], drop['y'] - 250.0, 0.0])
-            bot.goal = staging_goal.copy()
-
-            # Move there. Once close (tolerance 40mm), mark done.
-            if self.move_to_point(bot, staging_goal, label="Drop Staging", xy_tol=40.0):
-                bot.passed_drop_staging = True
-                bot.reset_pid() # Reset PID so we don't overshoot the next move
-            
-            return # Stop here. Next cycle will handle the final move.
-
-        # 3. Slot Priority Logic (5-Crate Setup)
-        my_slot = drop.get('zone_slot', 99)
-        zone_id = self.get_zone_for_crate(crate_id) # Ensure this is defined
-        count_in_zone = self.zone_drop_counts.get(zone_id, 0)
-
-        if my_slot in [3, 4]:
-            # Tucked in position for back row crates
-            bot.arm_target_base = 45.0
-            bot.arm_target_elbow = 110.0
+        if bot.pid_last_time is None:
+            dt = 0.03
         else:
-            # Standard carry position for front row (0, 1, 2)
-            bot.arm_target_base = 45.0
-            bot.arm_target_elbow = 135.0
-        
-       
-        
-        required_completed = 0
-        should_wait = False
+            dt = (now - bot.pid_last_time).nanoseconds / 1e9
 
-        if count_in_zone <= 3:
-            # If we only have 3 crates, Slot 2 must wait for 2 crates (0 and 1)
-            if my_slot == 2:
-                required_completed = 2
-                should_wait = True
-        else:
-            # If we have >3 crates, Slots 3 and 4 must wait for 3 crates (0, 1, 2)
-            if my_slot in [3, 4]:
-                required_completed = 3
-                should_wait = True
-            
-        if should_wait:
-            completed_in_zone = 0
-            for cid in self.completed_crates:
-                if self.get_zone_for_crate(cid) == zone_id:
-                    completed_in_zone += 1
-            
-            # If the zone isn't ready for this slot yet, HOLD POSITION.
-            if completed_in_zone < required_completed:
-                self.publish_wheel_velocities([0.0, 0.0, 0.0], bot.id, bot.base_angle, bot.elbow_angle, bot.magnet_state)
-                bot.is_moving = False
-                
-                # Log occasionally (every ~2 seconds) to avoid spam
-                if int(time.time()) % 2 == 0:
-                     self.get_logger().info(f"Bot {bot.id} | Waiting for front row. (Done: {completed_in_zone}/{required_completed})")
-                return
+        bot.pid_last_time = now
 
-        # 4. Define the final drop target using dynamic edge offsets
-        final_goal = np.array([drop['x'] + drop_dx, drop['y'] + drop_dy, drop_theta])
-        bot.goal = final_goal.copy()
+        if dt <= 0.001:
+            dt = 0.03
+        if dt > 0.1:
+            dt = 0.1
 
-        # 5. EXECUTE MOVEMENT WITH HIGH-PRECISION TOLERANCE
-        # We pass the specific x, y, and theta tolerances to move_to_point
-        reached = self.move_to_point(
-            bot, 
-            final_goal, 
-            label="Drop Slot Alignment", 
-            xy_tol=self.xy_tolerance,         # Radial tolerance (15.0)
-            theta_tol=5 # Yaw tolerance (5.0 degrees)
+        x, y, theta_deg = bot.pose
+        theta_rad = math.radians(theta_deg)
+
+        gx, gy, gtheta_deg = goal
+        gtheta_rad = math.radians(gtheta_deg)
+
+        error_x = gx - x
+        error_y = gy - y
+        error_theta = (gtheta_rad - theta_rad + math.pi) % (2 * math.pi) - math.pi
+
+        dist = math.hypot(error_x, error_y)
+
+        vx = bot.pid_x.compute(error_x, dt)
+        vy = bot.pid_y.compute(error_y, dt)
+        omega = bot.pid_theta.compute(error_theta, dt)
+
+        if label != "staging" and dist < self.slow_radius:
+            scale = max(0.3, dist / self.slow_radius)
+            vx *= scale
+            vy *= scale
+            omega *= scale
+
+        cos_t = math.cos(theta_rad)
+        sin_t = math.sin(theta_rad)
+
+        vx_r = vx * cos_t + vy * sin_t
+        vy_r = -vx * sin_t + vy * cos_t
+
+        wheel_vel = self.M_inv @ np.array([vx_r, vy_r, omega])
+
+        self.publish_pid_debug(
+            bot.id,
+            gx, x, vx,
+            gy, y, vy,
+            gtheta_deg, theta_deg, omega
         )
 
-        if reached:
-            # Additional check for independent X and Y axis precision
-            x, y, _ = self.get_filtered_pose(bot)
-            dx_error = abs(final_goal[0] - x)
-            dy_error = abs(final_goal[1] - y)
+        self.publish_wheel_velocities(
+            wheel_vel.tolist(),
+            bot.id,
+            bot.base_angle,
+            bot.elbow_angle,
+            bot.magnet_state
+        )
 
-            if dx_error < self.xy_tolerance_x and dy_error < self.xy_tolerance_y:
-                bot.move_after_attach = False
-                bot.dropping = True            
-                bot.mag_timer_start = None    
-                bot.drop_pose_logged = False
-                self.get_logger().info(f"Bot {bot.id} | Precisely Aligned at Drop: dx={dx_error:.1f}, dy={dy_error:.1f}")
+        current_xy_tol = xy_tol if xy_tol is not None else (self.xy_tolerance + 3.0)
+        current_theta_tol = theta_tol if theta_tol is not None else 15.0
+
+        if dist < current_xy_tol and abs(error_theta) < math.radians(current_theta_tol):
+            bot.is_moving = False
+            self.publish_wheel_velocities(
+                [0.0, 0.0, 0.0],
+                bot.id,
+                bot.base_angle,
+                bot.elbow_angle,
+                bot.magnet_state
+            )
+            return True
+
+        return False
     """
     * Function Name: drop_crate
     * Input: bot (BotState) - The state object of the robot performing the drop.
@@ -3792,55 +3722,80 @@ class HolonomicMoveToCratesMulti(Node):
     * Example Call: self.publish_wheel_velocities([10.0, -10.0, 5.0], 0, 45.0, 180.0, 10)
     """
 
+    # Define the function with the required parameters including mag
     def publish_wheel_velocities(self, wheel_vel, bot_id, base=45.0, elbow=135.0, mag=0):
+        # Initialize the array message for bot commands
         msg = BotCmdArray()
+        # Initialize a single bot command message
         cmd = BotCmd()
-
+        # Set the bot ID from the parameter
         cmd.id = int(bot_id)
-        cmd.m1 = float(wheel_vel[0]) if len(wheel_vel) > 0 else 0.0
-        cmd.m2 = float(wheel_vel[1]) if len(wheel_vel) > 1 else 0.0
-        cmd.m3 = float(wheel_vel[2]) if len(wheel_vel) > 2 else 0.0
+        
+        # Check if the wheel velocity list has 3 or more items
+        if len(wheel_vel) >= 3:
+            # Assign the first velocity to motor 1 exactly as requested
+            cmd.m1 = float(-wheel_vel[0])
+            # Assign the second velocity to motor 2 exactly as requested
+            cmd.m2 = float(wheel_vel[1])
+            # Assign the third velocity to motor 3 exactly as requested
+            cmd.m3 = float(wheel_vel[2])
+        # Handle cases where the list is too short
+        else:
+            # Assign the first velocity if it exists, else default to zero
+            cmd.m1 = float(-wheel_vel[0]) if len(wheel_vel) > 0 else 0.0
+            # Assign the second velocity if it exists, else default to zero
+            cmd.m2 = float(wheel_vel[1]) if len(wheel_vel) > 1 else 0.0
+            # Default motor 3 to zero
+            cmd.m3 = 0.0
+            
+        # Set the base servo angle
         cmd.base = float(base)
+        # Set the elbow servo angle
         cmd.elbow = float(elbow)
-
-        # Only set this if your BotCmd message actually has a mag field
+        
+        # Check if the message definition includes a magnet field
         if hasattr(cmd, 'mag'):
+            # Set the magnet state
             cmd.mag = int(mag)
-
+            
+        # Append the populated command to the array
         msg.cmds.append(cmd)
+        # Publish the command array to the ROS topic
         self.publisher.publish(msg)
-
+        
+        # Check if we are running on real hardware instead of simulation
         if not self.simulation_mode:
+            # Define a helper to convert physical velocity to PWM signals
             def map_vel(v):
+                # Clamp the velocity to a maximum of 50 and minimum of -50
                 v = max(min(v, 50), -50)
+                # Map the -50 to 50 range onto a 0 to 180 PWM signal
                 return int(90 + (v / 50.0) * 90)
-
+                
+            # Build the JSON payload with straightforward, unswapped mapping
             payload = {
-                "m1": map_vel(cmd.m2),
-                "m2": map_vel(cmd.m1),
+                # Map cmd.m1 directly to physicalF m1
+                "m1": map_vel(cmd.m1),
+                # Map cmd.m2 directly to physical m2
+                "m2": map_vel(cmd.m2),
+                # Map cmd.m3 directly to physical m3
                 "m3": map_vel(cmd.m3),
+                # Send the rounded base angle
                 "base": int(round(base)),
+                # Send the elbow angle
                 "elbow": int(elbow),
+                # Send the electromagnet state
                 "mag": int(mag)
             }
-
+            
+            # Construct the specific MQTT topic for this bot
             topic = f"bot{bot_id}/cmd"
+            # Convert the payload to JSON and publish it via MQTT
             self.mqtt_client.publish(topic, json.dumps(payload))
-
-        """
-        * Function Name: stop_all_bots
-        * Input: None
-        * Output: None
-        * Logic: A safety shutdown routine. Directly sends a "neutral" MQTT payload to every robot ID, forcing motors to stop, arms to neutral, and magnets OFF. 
-        * Uses a 0.5s sleep to ensure network packets are flushed before the program exits.
-        *
-        * Example Call: self.stop_all_bots()
-        """
     def stop_all_bots(self):
         if self.simulation_mode:
             return
         self.get_logger().info("Sending STOP (Idle) command to all bots before shutdown...")
-        
         
         idle_payload = {
             "m1": 90,
@@ -3851,28 +3806,16 @@ class HolonomicMoveToCratesMulti(Node):
             "mag": 0
         }
         
-        
         for bot_id in self.bot_ids:
             topic = f"bot{bot_id}/cmd"
             try:
                 self.mqtt_client.publish(topic, json.dumps(idle_payload))
             except Exception as e:
                 print(f"Failed to send MQTT stop to Bot {bot_id}: {e}")
-
         
         time.sleep(0.5)
 
-    """
-    * Function Name: on_mqtt_message
-    * Input: client, userdata, msg (MQTT message object)
-    * Output: None
-    * Logic: Asynchronous listener for incoming sensor data from the robots.
-    * 1. Parses the topic string to identify the source robot ID.
-    * 2. Decodes the payload; specifically handles "botX/ir" topics.
-    * 3. Updates the `ir_detected` boolean based on the digital signal ('0' = detection).
-    *
-    * Example Call: Triggered automatically by the MQTT background thread.
-    """
+        
     def on_mqtt_message(self, client, userdata, msg):
         try:
             topic = msg.topic
@@ -3894,19 +3837,18 @@ class HolonomicMoveToCratesMulti(Node):
             self.get_logger().warn(f"MQTT Parse Error: {e}")
 
 # ---------------------- Main -------------------------------------
-"""
-* Function Name: main
-* Input: args (list) - Command line arguments passed to the script.
-* Output: None
-* Logic: The entry point for the ROS 2 node.
-* 1. Initializes the rclpy communication layer.
-* 2. Instantiates the 'HolonomicMoveToCratesMulti' class.
-* 3. Enters the 'spin' loop, which keeps the node alive to process timer callbacks, service requests, and topics.
-* 4. Exception Handling: Catches a KeyboardInterrupt (Ctrl+C) to trigger a safety shutdown of all physical robots via MQTT.
-* 5. Cleanup: Destroys the node and shuts down the ROS 2 context to free resources.
-*
-* Example Call: python3 multi_robot_controller.py
-"""
+    """
+    * Function Name: main
+    * Input: args (list) - Command line arguments passed to the script.
+    * Output: None
+    * Logic: The entry point for the ROS 2 node.
+    * 1. Initializes the rclpy communication layer.
+    * 2. Instantiates the 'HolonomicMoveToCratesMulti' class.
+    * 3. Enters the 'spin' loop, which keeps the node alive to process timer callbacks, service requests, and topics.
+    * 4. Exception Handling: Catches a KeyboardInterrupt (Ctrl+C) to trigger a safety shutdown of all physical robots via MQTT.
+    * 5. Cleanup: Destroys the node and shuts down the ROS 2 context to free resources.
+    * Example Call: python3 multi_robot_controller.py
+    """
 def main(args=None):
     rclpy.init(args=args)
     node = HolonomicMoveToCratesMulti()
