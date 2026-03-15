@@ -31,6 +31,7 @@ endif()
 install(
   PROGRAMS src/holonomic_perception.py
   PROGRAMS src/holonomic_controller.py
+  PROGRAMS src/multiholonomic_controller.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
