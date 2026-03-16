@@ -2,6 +2,7 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.logging import LoggingSeverity
 from hb_interfaces.msg import Poses2D, BotCmd, BotCmdArray
 import numpy as np
 import math
@@ -9,21 +10,23 @@ import time
 import random
 import itertools
 import json
-import paho.mqtt.client as mqtt
 from std_srvs.srv import Trigger
-from std_msgs.msg import String, Float64MultiArray 
+from std_msgs.msg import String, Float64MultiArray
 from scipy.optimize import linear_sum_assignment
 import heapq
 
 SIMULATION_MODE = True
 
-# ---------------- IMPORTS ----------------
-# Import simulation specific services if we are in simulation mode
+# ---------------------- Runtime Logging Switches -----------------------------
+# Set False to silence this node's logs (info/warn/error) completely.
+ENABLE_ALL_LOGS = True
+# FSM loop tracer to detect where each bot is stuck.
+ENABLE_LOOP_TRACE_LOGS = True
+LOOP_TRACE_LOG_INTERVAL_S = 1.0
+
 if SIMULATION_MODE:
-    # Import the service types for attaching/detaching links in Gazebo
     from linkattacher_msgs.srv import AttachLink, DetachLink
 else:
-    # Only import MQTT if we are in Real Life mode to avoid errors on Sim PC
     import paho.mqtt.client as mqtt
 
 # ---------------------- PID Controller Class (Fixed) ------------------------
@@ -308,6 +311,9 @@ class BotState:
         # Distance logging
         self.last_dist_log_time = time.time()
         self.dist_log_interval = 0.5 
+        self.loop_state = "INIT"
+        self.loop_state_enter_time = time.time()
+        self.last_loop_state_log_time = 0.0
 
         # magnet state
         self.magnet_state = 0
@@ -339,6 +345,7 @@ class BotState:
         self.follow_target_id = None
         self.locked_follow_dist = None
         self.follow_offset_distance = 245.
+        self.blocked_by_crate = False
         self.needs_local_replanning = False
         self.detour_goal = None
 
@@ -357,13 +364,13 @@ class BotState:
 
         # Enable filter 
         if self.id == 2:
-            self.use_filter = True   
+            self.use_filter = False   
             self.filter_alpha = 0.3  
         elif self.id == 4:
-            self.use_filter = True
+            self.use_filter = False
             self.filter_alpha = 0.2
         elif self.id == 0:
-            self.use_filter = True
+            self.use_filter = False
             self.filter_alpha = 0.3
         else:
             self.use_filter = False  
@@ -402,6 +409,12 @@ class HolonomicMoveToCratesMulti(Node):
     def __init__(self):
         super().__init__('holonomic_move_to_crates_multi') 
 
+        self.enable_all_logs = ENABLE_ALL_LOGS
+        self.enable_loop_trace_logs = ENABLE_LOOP_TRACE_LOGS
+        self.loop_trace_interval_s = LOOP_TRACE_LOG_INTERVAL_S
+        if not self.enable_all_logs:
+            self.get_logger().set_level(LoggingSeverity.FATAL)
+
         self.node_start_time = time.time()
         self.startup_delay = 5.0  # Seconds to wait for vision
         self.is_warmed_up = False
@@ -418,6 +431,7 @@ class HolonomicMoveToCratesMulti(Node):
         self.completed_crates = set()  # Global tracker for all completed crates
         self.drop_positions = {}  # Assigned drop locations per crate
         self.drop_positions_assigned = False  # One-time assignment flag
+        self.drop_position_offset_mm = 20.0  # Calibration offset applied to all drop coordinates
 
         self.last_time = self.get_clock().now()  # Global timing reference
 
@@ -443,6 +457,29 @@ class HolonomicMoveToCratesMulti(Node):
         self.hard_slow_distance = 100.0     # mm
         self.hard_slow_scale = 0.5          # 50%
 
+        # ---------------- Practical reachability compensations ----------------
+        # Bots were stabilizing near pre-stage without crossing the old hard threshold.
+        # Use a small approach offset and a wider stage tolerance to avoid deadlocks.
+        self.pre_stage_offset_mm = 35.0
+        # Pull the staging Y target slightly toward the current bot side so
+        # bots don't freeze ~100mm away in tight pickup lanes.
+        self.pre_stage_y_pull_mm = 60.0
+        self.pre_stage_reach_tolerance_default = 55.0
+
+        # When approaching a crate, apply a small goal offset toward the robot to
+        # compensate for real-world sensing/registration errors so the robot can
+        # actually reach its pickup point.
+        self.pickup_goal_offset_mm = 60.0
+        # Use a tighter radial tolerance during final pickup approach to avoid
+        # stopping prematurely due to the global xy_tolerance being too loose.
+        self.pickup_goal_tolerance_mm = 5.0
+
+        self.pre_stage_reach_tolerance_by_bot = {
+            0: 70.0,
+            2: 60.0,
+            4: 70.0
+        }
+
 
         # ---------------- Slowdown near goal ----------------
         self.slow_radius = 120.0      
@@ -450,6 +487,7 @@ class HolonomicMoveToCratesMulti(Node):
 
         # ---------------- Collision avoidance parameters ----------------
         self.follow_distance_threshold = 350.0  
+        self.crate_avoidance_threshold = 180.0
         self.bot_radius = 100.0
         # self.safety_radius = 550.0  
         # self.critical_radius = 400.0  
@@ -472,7 +510,7 @@ class HolonomicMoveToCratesMulti(Node):
         self.staging_y_threshold = 1400.0  
 
         # ---------------- Idle home points ----------------
-        self.idle_home_point_0 = np.array([1220.0,225.0,0.0])  
+        self.idle_home_point_0 = np.array([1218.0, 205.0, 0.0])
         self.idle_home_point_2 = np.array([1570.0,225.0,0.0])  
         self.idle_home_point_4 = np.array([870.0,225.0,0.0])  
 
@@ -571,22 +609,21 @@ class HolonomicMoveToCratesMulti(Node):
             #    'theta':{'kp':80,'ki':0.000,'kd':0.02,'max_out':self.max_vel*2}},
 
             0: {
-                'x':     {'kp': 0.4, 'ki': 0.0, 'kd': 0.1, 'max_out': self.max_vel},
-                'y':     {'kp': 0.8, 'ki': 0.05, 'kd': 0.02, 'max_out': self.max_vel},
-                
-                'theta': {'kp': 140.0, 'ki': 20.0, 'kd': 15.0, 'max_out': 40}
+                'x': {'kp': 4, 'ki': 0.0001, 'kd': 0.001, 'max_out': self.max_vel},
+            'y': {'kp': 5, 'ki': 0.0001, 'kd': 0.0001, 'max_out': self.max_vel},
+            'theta': {'kp': -9, 'ki': 0.001, 'kd': 0.0002, 'max_out': self.max_vel * 2}
             },
             
             2: {
 
-                'x':     {'kp': 0.7, 'ki': 0.15, 'kd': 0.1, 'max_out': 50.0},
-                'y':     {'kp': 0.7, 'ki': 0.15, 'kd': 0.1, 'max_out': 50.0},
-                'theta': {'kp': 150.0, 'ki': 2.5, 'kd': 2.0, 'max_out': 40.0}
+                'x': {'kp': 4, 'ki': 0.0001, 'kd': 0.001, 'max_out': self.max_vel},
+            'y': {'kp': 5, 'ki': 0.0001, 'kd': 0.0001, 'max_out': self.max_vel},
+            'theta': {'kp': -9, 'ki': 0.001, 'kd': 0.0002, 'max_out': self.max_vel * 2}
                 },
             4: {
-                'x':     {'kp': 0.65, 'ki': 0.05, 'kd': 0.25, 'max_out': self.max_vel},
-                'y':     {'kp': 0.65, 'ki': 0.05, 'kd': 0.25, 'max_out': self.max_vel},
-                'theta': {'kp': 110.0, 'ki': 1.5, 'kd': 12.0, 'max_out': 45.0}
+                'x': {'kp': 4, 'ki': 0.0001, 'kd': 0.001, 'max_out': self.max_vel},
+            'y': {'kp': 5, 'ki': 0.0001, 'kd': 0.0001, 'max_out': self.max_vel},
+            'theta': {'kp': -9, 'ki': 0.001, 'kd': 0.0002, 'max_out': self.max_vel * 2}
             },
         }
 
@@ -659,6 +696,7 @@ class HolonomicMoveToCratesMulti(Node):
 
         # Store the mode in the class for easy access
         self.simulation_mode = SIMULATION_MODE 
+        self.get_logger().info("Initializing bot arms to DOWN position...")
         
         # ---------------- HARDWARE / SIM SETUP ----------------
         if self.simulation_mode:
@@ -808,7 +846,29 @@ class HolonomicMoveToCratesMulti(Node):
 
                     bot.last_dist_log_time = now
 
-                 
+    def trace_bot_loop(self, bot: BotState, state: str, extra: str = ""):
+        """
+        Per-bot FSM tracer. Logs state transitions immediately and periodic
+        heartbeat logs while state remains unchanged to expose stuck loops.
+        """
+        if not self.enable_all_logs or not self.enable_loop_trace_logs:
+            return
+
+        now = time.time()
+        state_changed = (bot.loop_state != state)
+        if state_changed:
+            bot.loop_state = state
+            bot.loop_state_enter_time = now
+            bot.last_loop_state_log_time = 0.0
+
+        if state_changed or (now - bot.last_loop_state_log_time) >= self.loop_trace_interval_s:
+            elapsed = now - bot.loop_state_enter_time
+            suffix = f" | {extra}" if extra else ""
+            self.get_logger().info(
+                f"[LOOP] Bot {bot.id} | {state} | for {elapsed:.1f}s{suffix}"
+            )
+            bot.last_loop_state_log_time = now
+
 
     """
     * Function Name: calculate_cost_matrix
@@ -1205,7 +1265,7 @@ class HolonomicMoveToCratesMulti(Node):
                 
                 self.drop_positions[crate['id']] = {
                     'x': cx + ox,
-                    'y': cy + oy + 20, 
+                    'y': cy + oy + self.drop_position_offset_mm,
                     'zone_slot': slot_idx
                 }
                 self.zone_drop_counts[z] += 1
@@ -1527,6 +1587,10 @@ class HolonomicMoveToCratesMulti(Node):
         bots_to_check = [b for b in self.bots.values() if b.pose is not None]
         bots_that_should_follow = set()
 
+        # Reset crate-block status at the start of each cycle.
+        for bot in bots_to_check:
+            bot.blocked_by_crate = False
+
         now_time = time.time()
 
         for bot_a, bot_b in itertools.combinations(bots_to_check, 2):
@@ -1742,6 +1806,26 @@ class HolonomicMoveToCratesMulti(Node):
 
             bots_that_should_follow.add(follower.id)
 
+        # Bot-vs-crate hard blocking check (except assigned target crate).
+        for bot in bots_to_check:
+            if bot.is_following:
+                continue
+
+            my_target_id = -1
+            if bot.tracked_crate_id is not None:
+                my_target_id = bot.tracked_crate_id
+            elif bot.current_crate is not None:
+                my_target_id = bot.current_crate['id']
+
+            for crate in self.crates:
+                if crate['id'] == my_target_id:
+                    continue
+
+                dist_to_crate = math.hypot(bot.pose[0] - crate['x'], bot.pose[1] - crate['y'])
+                if dist_to_crate < self.crate_avoidance_threshold:
+                    bot.blocked_by_crate = True
+                    break
+
         # 7. Cleanup: Reset bots that are no longer in collision range
         for bot in bots_to_check:
             if bot.id not in bots_that_should_follow and bot.is_following:
@@ -1871,10 +1955,6 @@ class HolonomicMoveToCratesMulti(Node):
             goal_x = 0.0
             goal_y = 0.0
             if bot.goal is not None:
-                goal_x = float(bot.goal[0])
-                goal_y = float(bot.goal[1])
-
-            elif bot.goal is not None:
                 goal_x = float(bot.goal[0])
                 goal_y = float(bot.goal[1])
 
@@ -2106,6 +2186,9 @@ class HolonomicMoveToCratesMulti(Node):
         # 1. Warmup Phase: Accumulate Data, Don't Move
         if not self.is_warmed_up:
             elapsed = time.time() - self.node_start_time
+
+            # Force arm-down commands during warmup so top markers stay visible.
+            self.force_publish_all_arms_down()
             
             # --- ACCUMULATE CRATE DATA ---
             for c in self.crates:
@@ -2200,53 +2283,83 @@ class HolonomicMoveToCratesMulti(Node):
         # 6. Execute Per-Bot State Machine
         for bot in self.bots.values():
             if bot.pose is None:
+                self.trace_bot_loop(bot, "NO_POSE", "forcing_arm_down")
+                # Keep commanding arm-down pose for any bot that temporarily loses tracking.
+                base_down, elbow_down = self.arm_down_config.get(bot.id, (15.0, 180.0))
+                self.publish_wheel_velocities(
+                    [0.0, 0.0, 0.0],
+                    bot.id,
+                    base_down,
+                    elbow_down,
+                    0
+                )
                 continue
 
             # Always update arm smooth
             self.update_arm_smooth(bot)
 
             if bot.needs_local_replanning and bot.follow_target_id is not None:
+                self.trace_bot_loop(bot, "LOCAL_REPLAN", f"target={bot.follow_target_id}")
                 self.execute_local_replanning(bot, bot.follow_target_id)
                 continue
 
             # FOLLOW behavior
             if bot.is_following and bot.follow_target_id is not None:
+                self.trace_bot_loop(bot, "FOLLOW", f"leader={bot.follow_target_id}")
                 self.follow_bot(bot, bot.follow_target_id)
                 continue
 
+            if bot.blocked_by_crate:
+                self.trace_bot_loop(bot, "BLOCKED_BY_CRATE")
+                self.publish_wheel_velocities(
+                    [0.0, 0.0, 0.0],
+                    bot.id,
+                    bot.base_angle,
+                    bot.elbow_angle,
+                    bot.magnet_state
+                )
+                bot.is_moving = False
+                continue
+
             if bot.backing_up:
+                self.trace_bot_loop(bot, "BACKUP")
                 self.handle_backup(bot)
                 continue
 
             # Handle staging
             if bot.going_to_staging_point:
+                self.trace_bot_loop(bot, "GO_TO_STAGING")
                 self.move_to_staging(bot)
                 continue
 
             # Handle dropping
             if bot.dropping:
+                self.trace_bot_loop(bot, "DROPPING")
                 self.drop_crate(bot)
                 continue
 
             # Handle return home
             if bot.return_to_start:
+                self.trace_bot_loop(bot, "RETURN_HOME")
                 self.return_home(bot)
                 continue
 
             # Skip if this specific bot has no crate assigned
             if bot.current_crate is None:
+                self.trace_bot_loop(bot, "IDLE_NO_CRATE")
                 continue
 
             # ---------------- Magnet HOLD Transition ----------------
             now_wall = time.time()
             if bot.magnet_state == 10 and bot.mag_timer_start is not None:
                 if now_wall - bot.mag_timer_start >= 5.0:
-                    bot.magnet_state = 10
+                    bot.magnet_state = 9
                     bot.mag_timer_start = None
                     self.get_logger().info(f"Bot {bot.id} | Magnet switched to HOLD mode")
 
             # ---------------- FSM Execution ----------------
             if not bot.goal_reached:
+                self.trace_bot_loop(bot, "MOVE_NEAR_CRATE", f"crate={bot.tracked_crate_id}")
                 self.move_near_crate(bot)
 
             elif not bot.arm_placed:
@@ -2294,10 +2407,12 @@ class HolonomicMoveToCratesMulti(Node):
                                     )
 
                 if should_wait:
+                    self.trace_bot_loop(bot, "WAIT_SLOT_ORDER", f"crate={bot.tracked_crate_id}")
                     
                     self.publish_wheel_velocities([0.0, 0.0, 0.0], bot.id, bot.base_angle, bot.elbow_angle, 0)
                     continue
                 # ---------------------------------------------------------
+                self.trace_bot_loop(bot, "ARM_PLACE_DOWN", f"crate={bot.tracked_crate_id}")
 
                 # Arm DOWN + Magnet ON (State 10 = Pull)
                 if bot.magnet_state == 0:
@@ -2326,6 +2441,7 @@ class HolonomicMoveToCratesMulti(Node):
                     self.get_logger().info(f"Bot {bot.id} | Arm placed. Magnet ON. Waiting 2.0s...")
 
             elif not bot.arm_lifted:
+                self.trace_bot_loop(bot, "ARM_LIFT", f"crate={bot.tracked_crate_id}")
                 if bot.wait_start_time is not None:
                     if time.time() - bot.wait_start_time < 2.0:
                         self.publish_wheel_velocities([0.0,0.0,0.0], bot.id, bot.base_angle, bot.elbow_angle, 10)
@@ -2337,6 +2453,7 @@ class HolonomicMoveToCratesMulti(Node):
                 self.lift_arm_with_crate(bot)
 
             elif bot.move_after_attach:
+                self.trace_bot_loop(bot, "MOVE_TO_DROP", f"crate={bot.tracked_crate_id}")
                 self.check_pickup_failure(bot)
                 if bot.move_after_attach:
                     self.move_to_final_goal(bot)
@@ -2458,13 +2575,13 @@ class HolonomicMoveToCratesMulti(Node):
                 f"Bot {follower.id} | Detour complete, resuming global path"
             )
 
-    # ---------------- Follow Bot (Fixed: Tighter Deadband) ----------------
+    # ---------------- Follow Bot (Dynamic Track-Behind) ----------------
     """
     * Function Name: follow_bot
     * Input: follower (BotState), leader_id (int)
     * Output: None
-    * Logic: Implements the 'Pause' mechanic from the paper.
-    * The follower completely stops and records the duration it spends paused.
+    * Logic: Makes the follower maintain a safe trailing distance behind the leader.
+    * Uses move_to_point to keep trajectory handling consistent with other states.
     """
     def follow_bot(self, follower: BotState, leader_id: int):
         
@@ -2485,20 +2602,45 @@ class HolonomicMoveToCratesMulti(Node):
         follower.arm_target_base = 45.0
         follower.arm_target_elbow = 120.0
 
-        if leader_id not in self.bots: return
-        
-        # PAPER IMPLEMENTATION: The bot must PAUSE.
-        # Stop all movement immediately
-        self.publish_wheel_velocities([0.0, 0.0, 0.0], follower.id, follower.base_angle, follower.elbow_angle, follower.magnet_state)
-        follower.is_moving = False
-        
-        # Record the pause time for f2(x) calculation
-        if follower.pause_start_marker is None:
-            follower.pause_start_marker = time.time()
-            
-        self.get_logger().info(
-            f"[PAPER F2] Bot {follower.id} PAUSING for Bot {leader_id}"
-        )
+        if leader_id not in self.bots:
+            return
+
+        leader = self.bots[leader_id]
+        if leader.pose is None or follower.pose is None:
+            return
+
+        follower.is_moving = True
+
+        dx = leader.pose[0] - follower.pose[0]
+        dy = leader.pose[1] - follower.pose[1]
+        dist_to_leader = math.hypot(dx, dy)
+
+        tolerance = 20.0
+        if abs(dist_to_leader - follower.follow_offset_distance) < tolerance or dist_to_leader < 1.0:
+            self.publish_wheel_velocities(
+                [0.0, 0.0, 0.0],
+                follower.id,
+                follower.base_angle,
+                follower.elbow_angle,
+                follower.magnet_state
+            )
+            follower.is_moving = False
+            if follower.pause_start_marker is None:
+                follower.pause_start_marker = time.time()
+            return
+
+        dir_x = dx / dist_to_leader
+        dir_y = dy / dist_to_leader
+
+        target_x = leader.pose[0] - dir_x * follower.follow_offset_distance
+        target_y = leader.pose[1] - dir_y * follower.follow_offset_distance
+        follow_goal = np.array([target_x, target_y, 0.0])
+
+        self.move_to_point(follower, follow_goal, "follow", xy_tol=25.0, theta_tol=25.0)
+
+        if follower.pause_start_marker is not None:
+            follower.total_pause_time += (time.time() - follower.pause_start_marker)
+            follower.pause_start_marker = None
     # ---------------- Smooth Arm Update ----------------
     """
     * Function Name: update_arm_smooth
@@ -2642,10 +2784,10 @@ class HolonomicMoveToCratesMulti(Node):
         crate = bot.current_crate
         if crate is None: return
 
-        if bot.id == 0:   ox, oy = 12, 120
-        elif bot.id == 2: ox, oy = 10, 120
-        elif bot.id == 4: ox, oy = 18, 120
-        else:             ox, oy = 25, 120
+        if bot.id == 0:   ox, oy = 0,0
+        elif bot.id == 2: ox, oy = 0,0
+        elif bot.id == 4: ox, oy = 0,0
+        else:             ox, oy = 0,0
             
         cx, cy, cw_deg = crate['x'], crate['y'], crate['w']
         
@@ -2691,8 +2833,27 @@ class HolonomicMoveToCratesMulti(Node):
 
         # Pick the point closest to the robot
         final_x, final_y, final_theta_rad = min(candidates, key=lambda p: math.hypot(p[0]-rx, p[1]-ry))
-
         final_theta_rad = self.normalize_angle(final_theta_rad)
+
+        # --- APPLY PICKUP GOAL OFFSET ---
+        # Shift the final pickup goal slightly toward the robot to account for
+        # any registration/vision offsets so the bot doesn't stop short.
+        offset = self.pickup_goal_offset_mm
+        dx = final_x - rx
+        dy = final_y - ry
+        dist = math.hypot(dx, dy)
+        if dist > 1e-6 and offset > 0:
+            shift = min(offset, dist - 1.0)
+            if shift > 0:
+                scale = shift / dist
+                final_x -= dx * scale
+                final_y -= dy * scale
+
+                # DEBUG: Log when an offset is applied (throttled)
+                self.get_logger().info(
+                    f"Bot {bot.id} | Pickup goal offset applied: shift={shift:.1f}mm -> goal=({final_x:.1f},{final_y:.1f})",
+                    throttle_duration_sec=2.0
+                )
         
         # Identify Target Zone
         target_zone_idx = -1
@@ -2745,26 +2906,45 @@ class HolonomicMoveToCratesMulti(Node):
         if not bot.passed_crate_staging:
             
             staging_x = target_x 
+            stage_offset = self.pre_stage_offset_mm
+            curr_x = bot.pose[0]
+            curr_y = bot.pose[1]
 
             # Zones P1 (0) and P3 (2) -> Stage at X + 200
             if bot.pickup_zone_idx in [0, 2]: 
-                staging_x = crate['x'] + 200.0
+                staging_x = crate['x'] + 200.0 - stage_offset
                 
             # Zones P2 (1) and P4 (3) -> Stage at X - 200
             elif bot.pickup_zone_idx in [1, 3]: 
-                staging_x = crate['x'] - 200.0
+                staging_x = crate['x'] - 200.0 + stage_offset
             
-            # Use final_y so we align with the correct approach lane
-            staging_y = final_y 
+            # Keep stage in the correct approach lane, but pull it slightly
+            # toward current Y to avoid constant 100mm deadlock.
+            y_dir = 1.0 if final_y >= curr_y else -1.0
+            staging_y = final_y - (y_dir * self.pre_stage_y_pull_mm)
+
+            # Apply a goal offset toward the robot so the staged goal isn't
+            # repeatedly just out of reach due to sensor/target registration error.
+            staging_offset = self.pickup_goal_offset_mm
+            dx_s = staging_x - curr_x
+            dy_s = staging_y - curr_y
+            dist_s = math.hypot(dx_s, dy_s)
+            if dist_s > 1e-6 and staging_offset > 0:
+                shift = min(staging_offset, dist_s - 1.0)
+                if shift > 0:
+                    scale = shift / dist_s
+                    staging_x -= dx_s * scale
+                    staging_y -= dy_s * scale
 
             # Calculate distance to this staging point
             # Use raw pose for simple distance check or filtered if preferred
-            curr_x = bot.pose[0]
-            curr_y = bot.pose[1]
             dist_to_stage = math.hypot(staging_x - curr_x, staging_y - curr_y)
+            stage_tol = self.pre_stage_reach_tolerance_by_bot.get(
+                bot.id, self.pre_stage_reach_tolerance_default
+            )
 
             # --- CHECK ARRIVAL AT STAGE POINT ---
-            if dist_to_stage < 40.0: # 40mm Tolerance
+            if dist_to_stage < stage_tol:
                 bot.passed_crate_staging = True
                 bot.reset_pid() # Reset PID to prevent jerk when switching targets
                 self.get_logger().info(f"Bot {bot.id} | Staging Complete. Moving to Final Pickup.")
@@ -2820,9 +3000,13 @@ class HolonomicMoveToCratesMulti(Node):
         dx_error = abs(target_x - x)
         dy_error = abs(target_y - y)
 
-        radial_ok = dist_error < self.xy_tolerance
+        # Use a tighter tolerance for final pickup alignment (prevents stopping
+        # too early when the global tolerance is still satisfied).
+        if label in ["Crate Approach", "Crate Pre-Stage"]:
+            radial_ok = dist_error < self.pickup_goal_tolerance_mm
+        else:
+            radial_ok = dist_error < self.xy_tolerance
 
-        
         # 1. Calculate raw errors
         dx_error = abs(target_x - x)
         dy_error = abs(target_y - y)
@@ -2903,9 +3087,9 @@ class HolonomicMoveToCratesMulti(Node):
             vy_pid = 0.0
 
 
-        # Disable Obstacle Avoidance during "Highway Escape" 
-        # (Otherwise nearby zones might push us back into the shadow)
-        if label == "Highway Escape":
+        # Disable Obstacle Avoidance during pickup-lane approach states
+        # to prevent local minima near dense crate clusters.
+        if label in ["Highway Escape", "Crate Pre-Stage", "Crate Approach"]:
             vx, vy = vx_pid, vy_pid
         else:
             # Use your existing obstacle avoidance logic (ignore target crate)
@@ -2941,76 +3125,63 @@ class HolonomicMoveToCratesMulti(Node):
         vy *= bot.slowdown_scale
         omega *= bot.slowdown_scale
 
-        min_stiction_cw = 19.0   # Minimum positive power (CW)
-        min_stiction_ccw = 1.0   # Minimum negative power (CCW)
-        soft_theta_tol = math.radians(3.0) # Tolerance to stop jittering
+        # --- WRAP STICTION SO IT ONLY RUNS ON REAL HARDWARE ---
+        if not self.simulation_mode:
+            min_stiction_cw = 19.0   # Minimum positive power (CW)
+            min_stiction_ccw = 1.0   # Minimum negative power (CCW)
+            soft_theta_tol = math.radians(3.0) # Tolerance to stop jittering
 
-        # If within 20mm, ignore PID magnitude and use FIXED stiction speeds
-        if dist_error < 20.0 and abs(error_theta) > soft_theta_tol:
-            
-            if omega > 0:
-                # Force exact CW stiction speed
-                omega = min_stiction_cw
-            elif omega < 0:
-                # Force exact CCW stiction speed
-                omega = -min_stiction_ccw
-            
-            # Reset integral to prevent windup during this clamped movement
-            bot.pid_theta.integral = 0.0
-            
-            # Debug log (optional)
-            # self.get_logger().info(f"Bot {bot.id} | Soft Align: Force Omega={omega}")
-
-        min_stiction_vel = 4.0   # Minimum PWM needed to turn wheels
-        stiction_tol = 2.5        # mm (Don't boost if within 8mm)
-
-        min_stiction_omega = 13.0 if bot.id == 4 else 13.0  # Minimum rad/s to overcome motor stiction
-        theta_tol_deg = 3.0 if bot.id == 4 else 3.0       # Don't boost if within 2 degrees of target
-        theta_tol = math.radians(theta_tol_deg)
-
-        stiction_active_axes = []
-
-        # Boost X
-        if abs(target_x - x) > stiction_tol:
-            if abs(vx) < min_stiction_vel:
-                # Keep sign, force magnitude
-                vx = math.copysign(min_stiction_vel, vx)
-                bot.pid_x.integral = 0.0
-                stiction_active_axes.append("X")
-
-        # Boost Y
-        if abs(target_y - y) > stiction_tol:
-            if abs(vy) < min_stiction_vel:
-                vy = math.copysign(min_stiction_vel, vy)
-                bot.pid_y.integral = 0.0
-                stiction_active_axes.append("Y")
-
-        min_stiction_cw = 19.0   # Minimum positive power
-        min_stiction_ccw = 1.0   # Minimum negative power (magnitude)
-
-        if abs(error_theta) > theta_tol:
-            
-            # Case 1: PID wants to move CW (Positive Output)
-            if omega > 0:
-                if omega < min_stiction_cw:
+            # If within 20mm, ignore PID magnitude and use FIXED stiction speeds
+            if dist_error < 20.0 and abs(error_theta) > soft_theta_tol:
+                if omega > 0:
                     omega = min_stiction_cw
-                    bot.pid_theta.integral = 0.0
-                    stiction_active_axes.append("Theta_CW(+)")
-
-            # Case 2: PID wants to move CCW (Negative Output)
-            elif omega < 0:
-                # Check if the negative value is "weaker" than -1 (e.g., -0.5)
-                if omega > -min_stiction_ccw:
+                elif omega < 0:
                     omega = -min_stiction_ccw
-                    bot.pid_theta.integral = 0.0
-                    stiction_active_axes.append("Theta_CCW(-)")
+                bot.pid_theta.integral = 0.0
 
-        if stiction_active_axes:
-            self.get_logger().info(
-                f"Bot {bot.id} | STICTION FIX APPLIED: {stiction_active_axes}",
-                # throttle_duration_sec=1.0
-            )
+            min_stiction_vel = 4.0   # Minimum PWM needed to turn wheels
+            stiction_tol = 2.5       # mm (Don't boost if within 8mm)
 
+            min_stiction_omega = 13.0 if bot.id == 4 else 13.0
+            theta_tol_deg = 3.0 if bot.id == 4 else 3.0
+            theta_tol = math.radians(theta_tol_deg)
+
+            stiction_active_axes = []
+
+            # Boost X
+            if abs(target_x - x) > stiction_tol:
+                if abs(vx) < min_stiction_vel:
+                    vx = math.copysign(min_stiction_vel, vx)
+                    bot.pid_x.integral = 0.0
+                    stiction_active_axes.append("X")
+
+            # Boost Y
+            if abs(target_y - y) > stiction_tol:
+                if abs(vy) < min_stiction_vel:
+                    vy = math.copysign(min_stiction_vel, vy)
+                    bot.pid_y.integral = 0.0
+                    stiction_active_axes.append("Y")
+
+            min_stiction_cw = 19.0   
+            min_stiction_ccw = 1.0   
+
+            if abs(error_theta) > theta_tol:
+                if omega > 0:
+                    if omega < min_stiction_cw:
+                        omega = min_stiction_cw
+                        bot.pid_theta.integral = 0.0
+                        stiction_active_axes.append("Theta_CW(+)")
+                elif omega < 0:
+                    if omega > -min_stiction_ccw:
+                        omega = -min_stiction_ccw
+                        bot.pid_theta.integral = 0.0
+                        stiction_active_axes.append("Theta_CCW(-)")
+
+            if stiction_active_axes:
+                self.get_logger().info(
+                    f"Bot {bot.id} | STICTION FIX APPLIED: {stiction_active_axes}"
+                )
+        # --- END OF STICTION BLOCK ---
         cos_t, sin_t = math.cos(theta), math.sin(theta)
         vx_r = vx * cos_t + vy * sin_t
         vy_r = -vx * sin_t + vy * cos_t
@@ -3146,101 +3317,6 @@ class HolonomicMoveToCratesMulti(Node):
                 return True
         return False
     
-    """
-    * Function Name: move_to_final_goal
-    * Input: bot (BotState) - The state object of the robot currently carrying a crate.
-    * Output: None
-    * Logic: Manages the complex navigation and synchronization logic for dropping a crate.
-    * 1. Target Retrieval: Identifies the assigned drop zone and specific slot coordinates.
-    * 2. Staging Phase: Navigates to a point 250mm away from the slot to ensure a straight approach.
-    * 3. Slot Synchronization: Implements a "wait-your-turn" logic based on slot priority to prevent 
-    * physical collisions in multi-crate layouts (e.g., Back row waits for Front row).
-    * 4. Adaptive Arm Positioning: Tucks the arm in for tight back-row slots or extends for front-row slots.
-    * 5. Precision Docking: Executes final approach with high-tolerance PID control. 
-    * 6. State Transition: Switches the bot to the 'dropping' state once precisely aligned.
-    *
-    * Example Call: self.move_to_final_goal(bot)
-    """
-    
-    def move_to_point(self, bot: BotState, goal, label="target", xy_tol=None, theta_tol=None):
-        if bot.pose is None:
-            return False
-
-        bot.is_moving = True
-        now = self.get_clock().now()
-
-        if bot.pid_last_time is None:
-            dt = 0.03
-        else:
-            dt = (now - bot.pid_last_time).nanoseconds / 1e9
-
-        bot.pid_last_time = now
-
-        if dt <= 0.001:
-            dt = 0.03
-        if dt > 0.1:
-            dt = 0.1
-
-        x, y, theta_deg = bot.pose
-        theta_rad = math.radians(theta_deg)
-
-        gx, gy, gtheta_deg = goal
-        gtheta_rad = math.radians(gtheta_deg)
-
-        error_x = gx - x
-        error_y = gy - y
-        error_theta = (gtheta_rad - theta_rad + math.pi) % (2 * math.pi) - math.pi
-
-        dist = math.hypot(error_x, error_y)
-
-        vx = bot.pid_x.compute(error_x, dt)
-        vy = bot.pid_y.compute(error_y, dt)
-        omega = bot.pid_theta.compute(error_theta, dt)
-
-        if label != "staging" and dist < self.slow_radius:
-            scale = max(0.3, dist / self.slow_radius)
-            vx *= scale
-            vy *= scale
-            omega *= scale
-
-        cos_t = math.cos(theta_rad)
-        sin_t = math.sin(theta_rad)
-
-        vx_r = vx * cos_t + vy * sin_t
-        vy_r = -vx * sin_t + vy * cos_t
-
-        wheel_vel = self.M_inv @ np.array([vx_r, vy_r, omega])
-
-        self.publish_pid_debug(
-            bot.id,
-            gx, x, vx,
-            gy, y, vy,
-            gtheta_deg, theta_deg, omega
-        )
-
-        self.publish_wheel_velocities(
-            wheel_vel.tolist(),
-            bot.id,
-            bot.base_angle,
-            bot.elbow_angle,
-            bot.magnet_state
-        )
-
-        current_xy_tol = xy_tol if xy_tol is not None else (self.xy_tolerance + 3.0)
-        current_theta_tol = theta_tol if theta_tol is not None else 15.0
-
-        if dist < current_xy_tol and abs(error_theta) < math.radians(current_theta_tol):
-            bot.is_moving = False
-            self.publish_wheel_velocities(
-                [0.0, 0.0, 0.0],
-                bot.id,
-                bot.base_angle,
-                bot.elbow_angle,
-                bot.magnet_state
-            )
-            return True
-
-        return False
     """
     * Function Name: drop_crate
     * Input: bot (BotState) - The state object of the robot performing the drop.
@@ -3386,17 +3462,208 @@ class HolonomicMoveToCratesMulti(Node):
                 # 6. If top edge, reverse in the +Y direction
                 backup_dy = 100.0                 
             elif bot.drop_edge == 2: 
-                # 7. If right edge, reverse in the +X direction
-                backup_dx = 100.0                 
+                # 7. If right edge, reverse in the -X direction
+                backup_dx = -100.0
             elif bot.drop_edge == 3: 
-                # 8. If left edge, reverse in the -X direction
-                backup_dx = -100.0                
+                # 8. If left edge, reverse in the +X direction
+                backup_dx = 100.0
             
             # 9. Apply the calculated backup offsets to the current position
             bot.goal = np.array([current_x + backup_dx, current_y + backup_dy, current_w])
             
         # 4. Reset PID to ensure smooth start for the new motion
         bot.reset_pid()
+
+    def move_to_final_goal(self, bot: BotState):
+        """
+        * Function Name: move_to_final_goal
+        * Input: bot (BotState) - The state object of the robot currently carrying a crate.
+        * Output: None
+        * Logic: Manages the complex navigation and synchronization logic for dropping a crate.
+        * 1. Target Retrieval: Identifies the assigned drop zone and specific slot coordinates.
+        * 2. Drop Gate: Waits at a gate point if the drop zone is locked by another bot.
+        * 3. Staging Phase: Navigates to a point 250mm offset from the slot for a straight approach.
+        * 4. Adaptive Arm: Tucks arm for tight back-row slots; extends for front-row slots.
+        * 5. Precision Docking: Final approach with tighter PID tolerances.
+        * 6. State Transition: Switches bot to 'dropping' state once precisely aligned.
+        *
+        * Example Call: self.move_to_final_goal(bot)
+        """
+        if bot.tracked_crate_id is None:
+            return
+
+        drop_pos = self.drop_positions.get(bot.tracked_crate_id)
+        if drop_pos is None:
+            # Fallback: use final_goal if no drop position assigned
+            goal = bot.final_goal.copy()
+            bot.goal = goal
+            if self.move_to_point(bot, goal, "drop_fallback"):
+                bot.move_after_attach = False
+                bot.dropping = True
+            return
+
+        drop_x = drop_pos['x']
+        drop_y = drop_pos['y']
+        slot_idx = drop_pos.get('zone_slot', 0)
+        zone_id = self.get_zone_for_crate(bot.tracked_crate_id)
+        count_in_zone = self.zone_drop_counts.get(zone_id, 0)
+
+        # ----------------------------------------------------------------
+        # STEP 1 — DROP GATE (Zone Lock)
+        # Wait at the gate point if another bot is already inside the drop zone.
+        # ----------------------------------------------------------------
+        if not bot.passed_drop_gate:
+            gate_xy = self.drop_gates.get(zone_id)
+
+            if gate_xy is not None:
+                gate_goal = np.array([gate_xy[0], gate_xy[1], 0.0])
+                bot.goal = gate_goal.copy()
+
+                # Check who holds the zone lock
+                current_lock = self.zone_locks.get(zone_id)
+
+                if current_lock is None:
+                    # Zone is free — acquire the lock and pass through
+                    self.zone_locks[zone_id] = bot.id
+                    bot.passed_drop_gate = True
+                    bot.reset_pid()
+                    self.get_logger().info(
+                        f"Bot {bot.id} | LOCKED Drop Zone {zone_id} and passing gate."
+                    )
+
+                elif current_lock == bot.id:
+                    # We already hold the lock — just pass through
+                    bot.passed_drop_gate = True
+                    bot.reset_pid()
+
+                else:
+                    # Zone locked by someone else — check if sharing is possible
+                    other_bot = self.bots.get(current_lock)
+                    if other_bot is not None and other_bot.tracked_crate_id is not None:
+                        other_zone = self.get_zone_for_crate(other_bot.tracked_crate_id)
+                        same_zone = (other_zone == zone_id)
+
+                        if same_zone:
+                            # Two bots targeting the same zone — allow sharing
+                            bot.is_sharing_zone = True
+                            self.zone_locks[zone_id] = bot.id  # Take lock (both share)
+                            bot.passed_drop_gate = True
+                            bot.reset_pid()
+                            self.get_logger().info(
+                                f"Bot {bot.id} | Sharing Drop Zone {zone_id} with Bot {current_lock}."
+                            )
+                        else:
+                            # Different zones in conflict — wait at the gate
+                            dist_to_gate = math.hypot(
+                                gate_xy[0] - bot.pose[0],
+                                gate_xy[1] - bot.pose[1]
+                            )
+                            if dist_to_gate > 50.0:
+                                # Drive towards the gate while waiting
+                                self.move_to_point(bot, gate_goal, "drop_gate_wait")
+                            else:
+                                # Already at gate — hard stop and wait
+                                self.publish_wheel_velocities(
+                                    [0.0, 0.0, 0.0],
+                                    bot.id,
+                                    bot.base_angle,
+                                    bot.elbow_angle,
+                                    bot.magnet_state
+                                )
+                                bot.is_moving = False
+                                bot.pid_last_time = None
+
+                            self.get_logger().warn(
+                                f"Bot {bot.id} | Waiting at Drop Gate for Zone {zone_id} "
+                                f"(Locked by Bot {current_lock})"
+                            )
+                            return
+            else:
+                # No gate defined for this zone — pass through immediately
+                if self.zone_locks.get(zone_id) is None:
+                    self.zone_locks[zone_id] = bot.id
+                bot.passed_drop_gate = True
+
+        # ----------------------------------------------------------------
+        # STEP 2 — STAGING APPROACH (250 mm offset before the slot)
+        # ----------------------------------------------------------------
+        if not bot.passed_drop_staging:
+
+            # Determine the approach axis and direction based on which zone
+            # Zone 0 (top center): approach from -Y (below)
+            # Zone 1 (left):       approach from -X (right side)
+            # Zone 2 (right):      approach from +X (left side)
+            staging_offset = 250.0
+
+            if zone_id == 0:
+                stage_x = drop_x
+                stage_y = drop_y - staging_offset
+                bot.drop_edge = 0  # bottom edge approach
+            elif zone_id == 1:
+                stage_x = drop_x + staging_offset
+                stage_y = drop_y
+                bot.drop_edge = 3  # left edge approach (retreat +X)
+            elif zone_id == 2:
+                stage_x = drop_x - staging_offset
+                stage_y = drop_y
+                bot.drop_edge = 2  # right edge approach (retreat -X)
+            else:
+                stage_x = drop_x
+                stage_y = drop_y - staging_offset
+                bot.drop_edge = 0
+
+            stage_goal = np.array([stage_x, stage_y, 0.0])
+            bot.goal = stage_goal.copy()
+
+            # Arm position during transit: tucked for back-row slots
+            if count_in_zone <= 3:
+                is_back_slot = (slot_idx == 2)
+            else:
+                is_back_slot = (slot_idx in [3, 4])
+
+            if is_back_slot:
+                bot.arm_target_base = 45.0
+                bot.arm_target_elbow = 90.0   # Tuck arm in for tight spaces
+            else:
+                bot.arm_target_base = 45.0
+                bot.arm_target_elbow = 135.0  # Standard carry position
+
+            dist_to_stage = math.hypot(stage_x - bot.pose[0], stage_y - bot.pose[1])
+
+            if dist_to_stage < 30.0:
+                bot.passed_drop_staging = True
+                bot.reset_pid()
+                self.get_logger().info(
+                    f"Bot {bot.id} | Drop staging complete. Moving to slot ({drop_x:.0f}, {drop_y:.0f})."
+                )
+            else:
+                self.move_to_point(bot, stage_goal, "drop_staging")
+            return
+
+        # ----------------------------------------------------------------
+        # STEP 3 — FINAL PRECISION DOCKING
+        # ----------------------------------------------------------------
+        final_goal = np.array([drop_x, drop_y, 0.0])
+        bot.goal = final_goal.copy()
+
+        self.log_bot_distance(bot, drop_x, drop_y, "drop_final", gtheta=0.0)
+
+        reached = self.move_to_point(
+            bot,
+            final_goal,
+            label="drop_final",
+            xy_tol=12.0,      # Tighter tolerance for drop precision
+            theta_tol=15.0
+        )
+
+        if reached:
+            bot.move_after_attach = False
+            bot.dropping = True
+            bot.reset_pid()
+            self.get_logger().info(
+                f"Bot {bot.id} | Reached drop slot {slot_idx} in Zone {zone_id}. "
+                f"Starting DROP sequence."
+            )
     """
     * Function Name: move_to_staging
     * Input: bot (BotState) - The robot state object currently executing the staging maneuver.
@@ -3605,32 +3872,33 @@ class HolonomicMoveToCratesMulti(Node):
         omega *= bot.slowdown_scale
 
         
-        # 1. Update constants to match move_near_crate
-        min_stiction_vel = 4.0    
-        stiction_tol = 2.5        
+        if not self.simulation_mode:
+            # 1. Update constants to match move_near_crate
+            min_stiction_vel = 4.0    
+            stiction_tol = 2.5        
 
-        # 2. Add Rotation Constants
-        min_stiction_omega = 13.0 if bot.id == 4 else 13.0
-        theta_tol_deg = 3.0 if bot.id == 4 else 3.0
-        stiction_theta_tol = math.radians(theta_tol_deg)
+            # 2. Add Rotation Constants
+            min_stiction_omega = 13.0 if bot.id == 4 else 13.0
+            theta_tol_deg = 3.0 if bot.id == 4 else 3.0
+            stiction_theta_tol = math.radians(theta_tol_deg)
 
-        # Boost X
-        if abs(gx - x) > stiction_tol:
-            if abs(vx) < min_stiction_vel:
-                vx = math.copysign(min_stiction_vel, vx)
-                bot.pid_x.integral = 0.0
+            # Boost X
+            if abs(gx - x) > stiction_tol:
+                if abs(vx) < min_stiction_vel:
+                    vx = math.copysign(min_stiction_vel, vx)
+                    bot.pid_x.integral = 0.0
 
-        # Boost Y
-        if abs(gy - y) > stiction_tol:
-            if abs(vy) < min_stiction_vel:
-                vy = math.copysign(min_stiction_vel, vy)
-                bot.pid_y.integral = 0.0
+            # Boost Y
+            if abs(gy - y) > stiction_tol:
+                if abs(vy) < min_stiction_vel:
+                    vy = math.copysign(min_stiction_vel, vy)
+                    bot.pid_y.integral = 0.0
 
-        # 3. Add Omega Boost (This was missing entirely in move_to_point)
-        if abs(etheta) > stiction_theta_tol:
-            if abs(omega) < min_stiction_omega:
-                omega = math.copysign(min_stiction_omega, etheta)
-                bot.pid_theta.integral = 0.0
+            # 3. Add Omega Boost (This was missing entirely in move_to_point)
+            if abs(etheta) > stiction_theta_tol:
+                if abs(omega) < min_stiction_omega:
+                    omega = math.copysign(min_stiction_omega, etheta)
+                    bot.pid_theta.integral = 0.0
         
 
         cos_t, sin_t = math.cos(theta), math.sin(theta)
@@ -3687,9 +3955,6 @@ class HolonomicMoveToCratesMulti(Node):
         
         
         
-        bot.passed_drop_gate = False  
-        # ------------------------
-
         bot.passed_gate = False        # Reset Pickup Gate
         bot.passed_drop_gate = False   # Reset Drop Gate
         
@@ -3723,46 +3988,27 @@ class HolonomicMoveToCratesMulti(Node):
     """
 
     # Define the function with the required parameters including mag
+    # Define the function with the required parameters including mag
     def publish_wheel_velocities(self, wheel_vel, bot_id, base=45.0, elbow=135.0, mag=0):
-        # Initialize the array message for bot commands
+        # --- ROS SIMULATION PUBLISH ---
         msg = BotCmdArray()
-        # Initialize a single bot command message
         cmd = BotCmd()
-        # Set the bot ID from the parameter
-        cmd.id = int(bot_id)
-        
-        # Check if the wheel velocity list has 3 or more items
+        cmd.id = bot_id
         if len(wheel_vel) >= 3:
-            # Assign the first velocity to motor 1 exactly as requested
-            cmd.m1 = float(-wheel_vel[0])
-            # Assign the second velocity to motor 2 exactly as requested
-            cmd.m2 = float(wheel_vel[1])
-            # Assign the third velocity to motor 3 exactly as requested
-            cmd.m3 = float(wheel_vel[2])
-        # Handle cases where the list is too short
+            cmd.m1, cmd.m2, cmd.m3 = wheel_vel[0], wheel_vel[1], wheel_vel[2]
         else:
-            # Assign the first velocity if it exists, else default to zero
-            cmd.m1 = float(-wheel_vel[0]) if len(wheel_vel) > 0 else 0.0
-            # Assign the second velocity if it exists, else default to zero
-            cmd.m2 = float(wheel_vel[1]) if len(wheel_vel) > 1 else 0.0
-            # Default motor 3 to zero
+            cmd.m1 = wheel_vel[0] if len(wheel_vel) > 0 else 0.0
+            cmd.m2 = wheel_vel[1] if len(wheel_vel) > 1 else 0.0
             cmd.m3 = 0.0
-            
-        # Set the base servo angle
-        cmd.base = float(base)
-        # Set the elbow servo angle
-        cmd.elbow = float(elbow)
-        
-        # Check if the message definition includes a magnet field
+        cmd.base = base
+        cmd.elbow = elbow
         if hasattr(cmd, 'mag'):
             # Set the magnet state
             cmd.mag = int(mag)
-            
-        # Append the populated command to the array
         msg.cmds.append(cmd)
-        # Publish the command array to the ROS topic
         self.publisher.publish(msg)
         
+        # --- MQTT HARDWARE PUBLISH (This was missing!) ---
         # Check if we are running on real hardware instead of simulation
         if not self.simulation_mode:
             # Define a helper to convert physical velocity to PWM signals
@@ -3772,10 +4018,10 @@ class HolonomicMoveToCratesMulti(Node):
                 # Map the -50 to 50 range onto a 0 to 180 PWM signal
                 return int(90 + (v / 50.0) * 90)
                 
-            # Build the JSON payload with straightforward, unswapped mapping
+            # Build the JSON payload with the requested INVERTED m1 mapping
             payload = {
-                # Map cmd.m1 directly to physicalF m1
-                "m1": map_vel(cmd.m1),
+                # Add negative sign to invert physical motor 1
+                "m1": map_vel(-cmd.m1),
                 # Map cmd.m2 directly to physical m2
                 "m2": map_vel(cmd.m2),
                 # Map cmd.m3 directly to physical m3
@@ -3792,6 +4038,22 @@ class HolonomicMoveToCratesMulti(Node):
             topic = f"bot{bot_id}/cmd"
             # Convert the payload to JSON and publish it via MQTT
             self.mqtt_client.publish(topic, json.dumps(payload))
+
+    def force_publish_all_arms_down(self):
+        """
+        Force-commands all bots to keep arms in down configuration while stationary.
+        This helps keep ArUco markers visible and reacquire tracking at startup/warmup.
+        """
+        for bot_id in self.bot_ids:
+            base_down, elbow_down = self.arm_down_config.get(bot_id, (15.0, 180.0))
+            self.publish_wheel_velocities(
+                [0.0, 0.0, 0.0],
+                bot_id,
+                base_down,
+                elbow_down,
+                0
+            )
+        
     def stop_all_bots(self):
         if self.simulation_mode:
             return

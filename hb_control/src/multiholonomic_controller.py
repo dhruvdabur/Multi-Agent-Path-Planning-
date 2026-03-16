@@ -10,7 +10,11 @@ import time
 import random
 import itertools
 import json
+import heapq
 from std_msgs.msg import String
+
+ENABLE_LOOP_TRACE_LOGS = True
+LOOP_TRACE_LOG_INTERVAL_S = 1.0
 # ---------------------- PID Controller Class --------------------------------
 class PID:
     def __init__(self, kp, ki, kd, max_out=1.0):
@@ -34,6 +38,89 @@ class PID:
     def reset(self):
         self.integral = 0.0
         self.prev_error = 0.0
+
+
+# ---------------------- Raster Grid + A* -----------------------------------
+class RasterGrid:
+    def __init__(self, width_mm, height_mm, resolution_mm):
+        self.resolution = resolution_mm
+        self.cols = int(width_mm / resolution_mm)
+        self.rows = int(height_mm / resolution_mm)
+        self.grid = np.zeros((self.rows, self.cols), dtype=np.int8)
+
+    def world_to_grid(self, x, y):
+        col = int(x / self.resolution)
+        row = int(y / self.resolution)
+        return (max(0, min(row, self.rows - 1)), max(0, min(col, self.cols - 1)))
+
+    def grid_to_world(self, row, col):
+        x = (col * self.resolution) + (self.resolution / 2.0)
+        y = (row * self.resolution) + (self.resolution / 2.0)
+        return (x, y)
+
+    def clear_grid(self):
+        self.grid.fill(0)
+
+    def set_obstacle(self, x, y, radius_mm):
+        cell_radius = int(radius_mm / self.resolution)
+        r_idx, c_idx = self.world_to_grid(x, y)
+        r_start = max(0, r_idx - cell_radius)
+        r_end = min(self.rows, r_idx + cell_radius + 1)
+        c_start = max(0, c_idx - cell_radius)
+        c_end = min(self.cols, c_idx + cell_radius + 1)
+        self.grid[r_start:r_end, c_start:c_end] = 1
+
+
+def a_star_search(grid_obj, start_xy, goal_xy):
+    start = grid_obj.world_to_grid(start_xy[0], start_xy[1])
+    goal = grid_obj.world_to_grid(goal_xy[0], goal_xy[1])
+
+    if grid_obj.grid[start] == 1 or grid_obj.grid[goal] == 1:
+        return [], 999999.0
+
+    neighbors = [
+        (0, 1, 1.0), (1, 0, 1.0), (0, -1, 1.0), (-1, 0, 1.0),
+        (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414)
+    ]
+    open_set = [(0.0, start[0], start[1])]
+    g_score = np.full((grid_obj.rows, grid_obj.cols), np.inf)
+    g_score[start] = 0.0
+    came_from = {}
+
+    def get_heuristic(r, c):
+        dr = abs(r - goal[0])
+        dc = abs(c - goal[1])
+        return (max(dr, dc) + 0.414 * min(dr, dc)) * 1.001
+
+    while open_set:
+        _, r, c = heapq.heappop(open_set)
+        if (r, c) == goal:
+            path = []
+            path_length_mm = 0.0
+            curr = (r, c)
+            while curr in came_from:
+                path.append(grid_obj.grid_to_world(curr[0], curr[1]))
+                prev = came_from[curr]
+                p1 = grid_obj.grid_to_world(curr[0], curr[1])
+                p2 = grid_obj.grid_to_world(prev[0], prev[1])
+                path_length_mm += math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+                curr = prev
+            path.reverse()
+            return path, path_length_mm
+
+        for dr, dc, weight in neighbors:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < grid_obj.rows and 0 <= nc < grid_obj.cols:
+                if grid_obj.grid[nr, nc] == 1:
+                    continue
+                tentative_g = g_score[r, c] + weight
+                if tentative_g < g_score[nr, nc]:
+                    came_from[(nr, nc)] = (r, c)
+                    g_score[nr, nc] = tentative_g
+                    f_score = tentative_g + get_heuristic(nr, nc)
+                    heapq.heappush(open_set, (f_score, nr, nc))
+
+    return [], 999999.0
 
 
 # ---------------------- Per-bot State ---------------------------------------
@@ -71,11 +158,17 @@ class BotState:
         self.is_moving = False
         self.slowdown_scale = 1.0
         self.priority_cooldown_end_time = None
+        self.loop_state = "INIT"
+        self.loop_state_enter_time = time.time()
+        self.last_loop_state_log_time = 0.0
         
         # [FOLLOW BEHAVIOR] New variables
         self.is_following = False
         self.follow_target_id = None
         self.follow_offset_distance = 245.0  # Stay this far behind the leader
+        self.current_path = []
+        self.path_goal_cache = None
+        self.last_path_calc_time = 0.0
 
         # PID controllers
         self.pid_x = PID(**pid_params['x'])
@@ -102,6 +195,8 @@ class BotState:
 class HolonomicMoveToCratesMulti(Node):
     def __init__(self):
         super().__init__('holonomic_move_to_crates_multi')
+        self.enable_loop_trace_logs = ENABLE_LOOP_TRACE_LOGS
+        self.loop_trace_interval_s = LOOP_TRACE_LOG_INTERVAL_S
         # Visualization Publisher
         self.viz_publisher = self.create_publisher(String, '/zone_debug', 10)
         # Robot Parameters
@@ -112,6 +207,7 @@ class HolonomicMoveToCratesMulti(Node):
         self.drop_positions_assigned = False
 
         self.last_time = self.get_clock().now()
+        self.raster = RasterGrid(2438.4, 2438.4, 20.0)
 
         self.xy_tolerance = 5.0
         self.theta_tolerance_deg = 3.0
@@ -226,6 +322,23 @@ class HolonomicMoveToCratesMulti(Node):
             for bid in self.bot_ids:
                 self.publish_wheel_velocities([0.0, 0.0, 0.0], bid, base=45.0, elbow=45.0)
                 time.sleep(1)
+
+    def trace_bot_loop(self, bot: BotState, state: str, extra: str = ""):
+        if not self.enable_loop_trace_logs:
+            return
+
+        now = time.time()
+        state_changed = (bot.loop_state != state)
+        if state_changed:
+            bot.loop_state = state
+            bot.loop_state_enter_time = now
+            bot.last_loop_state_log_time = 0.0
+
+        if state_changed or (now - bot.last_loop_state_log_time) >= self.loop_trace_interval_s:
+            elapsed = now - bot.loop_state_enter_time
+            suffix = f" | {extra}" if extra else ""
+            self.get_logger().info(f"[LOOP] Bot {bot.id} | {state} | for {elapsed:.1f}s{suffix}")
+            bot.last_loop_state_log_time = now
 
     # ---------------- Callbacks ----------------
     def pose_cb(self, msg: Poses2D):
@@ -360,6 +473,9 @@ class HolonomicMoveToCratesMulti(Node):
                     bot.arm_lifted = False
                     bot.move_after_attach = False
                     bot.box_detached = False
+                    bot.current_path = []
+                    bot.path_goal_cache = None
+                    bot.last_path_calc_time = 0.0
                     bot.reset_pid()
                     zone_id = self.get_zone_for_crate(nearest['id'])
                     self.get_logger().info(f"Bot {bot.id} assigned to crate {nearest['id']} (Zone {zone_id})")
@@ -446,6 +562,14 @@ class HolonomicMoveToCratesMulti(Node):
         for bot in self.bots.values():
             bot.slowdown_scale = 1.0
 
+        # Refresh rasterized obstacle map each control cycle
+        self.raster.clear_grid()
+        for c in self.crates:
+            self.raster.set_obstacle(c['x'], c['y'], 100.0)
+        for b_state in self.bots.values():
+            if b_state.pose is not None and b_state.is_permanently_idle:
+                self.raster.set_obstacle(b_state.pose[0], b_state.pose[1], 150.0)
+
         # Assign crates
         self.assign_crates_greedily()
 
@@ -531,34 +655,41 @@ class HolonomicMoveToCratesMulti(Node):
         # Iterate through each bot's state machine
         for bot in self.bots.values():
             if bot.pose is None:
+                self.trace_bot_loop(bot, "NO_POSE")
                 continue
 
             # Handle follow behavior FIRST (highest priority)
             if bot.is_following and bot.follow_target_id is not None:
+                self.trace_bot_loop(bot, "FOLLOW", f"leader={bot.follow_target_id}")
                 self.get_logger().info(f"Bot {bot.id} executing FOLLOW behavior for Bot {bot.follow_target_id}")
                 self.follow_bot(bot, bot.follow_target_id)
                 continue
             # Handle Crate Avoidance (Second priority)
             if bot.blocked_by_crate:
+                self.trace_bot_loop(bot, "BLOCKED_BY_CRATE")
                 self.publish_wheel_velocities([0.0, 0.0, 0.0], bot.id)
                 continue
             # Skip bots that are dropping
             if bot.box_detached and bot.current_crate is not None:
+                self.trace_bot_loop(bot, "DROP_IN_PROGRESS", f"crate={bot.tracked_crate_id}")
                 self.get_logger().debug(f"Bot {bot.id} is dropping crate {bot.tracked_crate_id}, skipping")
                 continue
             
             # Handle staging point move for ALL BOTS
             if bot.going_to_staging_point:
+                self.trace_bot_loop(bot, "GO_TO_STAGING")
                 self.move_to_staging(bot)
                 continue
 
             # Handle return home
             if bot.return_to_start:
+                self.trace_bot_loop(bot, "RETURN_HOME")
                 self.return_home(bot)
                 continue
 
             # If no active crate, skip
             if bot.current_crate is None:
+                self.trace_bot_loop(bot, "IDLE_NO_CRATE")
                 continue
                 
             # ... (inside the loop over bots) ...
@@ -619,18 +750,24 @@ class HolonomicMoveToCratesMulti(Node):
 
             # Run state machine
             if not bot.goal_reached:
+                 self.trace_bot_loop(bot, "MOVE_NEAR_CRATE", f"crate={bot.tracked_crate_id}")
                  self.move_near_crate(bot)
             # ... rest of state machine ...
             # Run state machine
             if not bot.goal_reached:
+                self.trace_bot_loop(bot, "MOVE_NEAR_CRATE", f"crate={bot.tracked_crate_id}")
                 self.move_near_crate(bot)
             elif not bot.arm_placed:
+                self.trace_bot_loop(bot, "PLACE_ARM", f"crate={bot.tracked_crate_id}")
                 self.place_arm_on_crate(bot)
             elif not bot.box_attached:
+                self.trace_bot_loop(bot, "ATTACH_CRATE", f"crate={bot.tracked_crate_id}")
                 self.attach_crate(bot)
             elif not bot.arm_lifted:
+                self.trace_bot_loop(bot, "LIFT_ARM", f"crate={bot.tracked_crate_id}")
                 self.lift_arm_with_crate(bot)
             elif bot.move_after_attach:
+                self.trace_bot_loop(bot, "MOVE_TO_DROP", f"crate={bot.tracked_crate_id}")
                 self.move_to_final_goal(bot)
         # -----------------------------------------------------------
         # NEW: GATHER DATA FOR VISUALIZATION
@@ -914,6 +1051,47 @@ class HolonomicMoveToCratesMulti(Node):
         goal_x, goal_y, goal_theta_deg = goal
         goal_theta_rad = math.radians(goal_theta_deg)
 
+        # A* replanning trigger
+        target_coords = (goal_x, goal_y)
+        needs_recalc = False
+        if not bot.current_path:
+            needs_recalc = True
+        elif bot.path_goal_cache is None:
+            needs_recalc = True
+        elif math.hypot(goal_x - bot.path_goal_cache[0], goal_y - bot.path_goal_cache[1]) > 50.0:
+            needs_recalc = True
+        elif time.time() - bot.last_path_calc_time > 1.0:
+            needs_recalc = True
+
+        if needs_recalc:
+            bot.current_path, _ = a_star_search(self.raster, (x, y), target_coords)
+            bot.path_goal_cache = target_coords
+            bot.last_path_calc_time = time.time()
+
+        # Path follower with lookahead
+        if bot.current_path and len(bot.current_path) > 0:
+            lookahead_dist = 120.0
+            waypoint_tol = 40.0
+            target_pt = bot.current_path[-1]
+
+            while len(bot.current_path) > 1:
+                dist_to_first = math.hypot(bot.current_path[0][0] - x, bot.current_path[0][1] - y)
+                if dist_to_first < waypoint_tol:
+                    bot.current_path.pop(0)
+                else:
+                    break
+
+            for pt in bot.current_path:
+                d = math.hypot(pt[0] - x, pt[1] - y)
+                if d > lookahead_dist:
+                    target_pt = pt
+                    break
+
+            goal_x = target_pt[0]
+            goal_y = target_pt[1]
+            if target_pt != bot.current_path[-1]:
+                bot.slowdown_scale = 1.0
+
         error_x = goal_x - x
         error_y = goal_y - y
         error_theta = (goal_theta_rad - theta_rad + math.pi) % (2 * math.pi) - math.pi
@@ -1044,6 +1222,9 @@ class HolonomicMoveToCratesMulti(Node):
                 bot.has_returned_home = False
                 bot.move_after_attach = False
                 bot.box_detached = False
+                bot.current_path = []
+                bot.path_goal_cache = None
+                bot.last_path_calc_time = 0.0
                 bot.reset_pid()
                 
                 # Priority cooldown
@@ -1072,6 +1253,9 @@ class HolonomicMoveToCratesMulti(Node):
         bot.is_moving = False
         bot.is_following = False
         bot.follow_target_id = None
+        bot.current_path = []
+        bot.path_goal_cache = None
+        bot.last_path_calc_time = 0.0
         bot.reset_pid()
 
     def publish_wheel_velocities(self, wheel_vel, bot_id, base=45.0, elbow=45.0):
